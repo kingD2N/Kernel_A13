@@ -1,4 +1,4 @@
-name: Compile Kernel Melt Rebase - POCO F4 GT (Ingres) - AOSP13 [Lineage-20 DT]
+name: Compile Kernel Melt Rebase - POCO F4 GT (Ingres) - Evolution X (Android 13) [Lineage-20 DT]
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ on:
           - melt-MIX
 
       modules_branch:
-        description: "Branch for the LineageOS modules repo (unaffected by kernel_source/kernel_branch above - currently defaults to lineage-23.2)"
+        description: "Branch for the LineageOS modules repo - INDEPENDENT of this workflow's locked lineage-20 devicetree, do not set this to lineage-20 (that branch does not exist upstream here; only lineage-22.2/23.0/23.1/23.2 do). Leave at the default unless you've confirmed otherwise."
         required: true
         type: string
         default: "lineage-23.2"
@@ -42,9 +42,9 @@ on:
         description: "kernel"
         required: false
         type: choice
-        default: AOSP13-KERNEL
+        default: EvoX-KERNEL
         options:
-          - AOSP13-KERNEL
+          - EvoX-KERNEL
           - Melt-KERNEL
           - MIX™-KERNEL
           - LazyGoogle-KERNEL
@@ -174,7 +174,7 @@ jobs:
           fi
 
           # KERNEL_BASE intentionally stays "android12" here even though this workflow
-          # targets an AOSP Android 13 build: ingres shipped on Android 12, so per Google's
+          # targets an Evolution X (Android 13) build: ingres shipped on Android 12, so per Google's
           # GKI KMI policy it is permanently locked to the android12-5.10 kernel base -
           # vendor .ko blobs are compiled against that ABI regardless of which Android
           # version the ROM on top is running. This workflow's devicetree is locked to
@@ -532,7 +532,7 @@ jobs:
 
       - name: Make AnyKernel3
         run: |
-          ZIP_NAME="${KERNEL_NAME}_AOSP13_${{ inputs.ksu_type }}"
+          ZIP_NAME="${KERNEL_NAME}_EvoX_${{ inputs.ksu_type }}"
 
           if [[ "${{ inputs.susfs }}" == true ]]; then
             ZIP_NAME="${ZIP_NAME}_SuSFS"
@@ -554,7 +554,7 @@ jobs:
       - name: Create GitHub Release
         run: |
           BUILD_TIME=$(date -u +"%Y%m%d_%H%M")
-          REL_NAME="${KERNEL_NAME}-AOSP13-${BUILD_TIME}"
+          REL_NAME="${KERNEL_NAME}-EvoX-${BUILD_TIME}"
           echo "REL_NAME=${REL_NAME}" >> $GITHUB_ENV
           cd ${GITHUB_WORKSPACE}
           ZIP_FILE=$(ls *.zip)
@@ -608,7 +608,7 @@ jobs:
           | | |
           |:---|:---|
           | 📱 Device | POCO F4 GT (ingres) • Redmi K50G (ingres) |
-          | 🟠 ROM Support | AOSP Android 13 |
+          | 🟣 ROM Support | Evolution X (Android 13) |
           | 🖥️ Kernel Name | ${KERNEL_NAME} |
           | 🧬 Kernel Base | ${KERNEL_BASE} |
           | 🌳 Devicetree | ${DT_SOURCE} @ ${DT_BRANCH} |
