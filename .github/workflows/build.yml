@@ -18,6 +18,10 @@ on:
           - LazyGoogle_ORI
           - melt-rebase-4LazyGoogle
           - melt-MIX
+          - melt-rebase-hyperos
+          - melt
+          - xiaomi
+          - MIUI HOS
 
       ksu_type:
         description: "KernelSU Version"
