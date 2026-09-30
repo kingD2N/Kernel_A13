@@ -328,7 +328,15 @@ jobs:
             cp ./kernel_patches/fs/* ../fs/
             cp ./kernel_patches/include/linux/* ../include/linux/
             cd ..
-            patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch
+            if ! patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch; then
+              SUSFS_REJ_COUNT=$(find . -name "*.rej" | wc -l)
+              echo "::warning::SUSFS patch didn't apply 100% cleanly on this kernel_source tree (${SUSFS_REJ_COUNT} hunk(s) rejected) - continuing with what DID apply instead of failing the whole build."
+              find . -name "*.rej" -exec echo "::warning::  unapplied hunk(s) recorded in {}" \;
+              find . -name "*.rej" -print0 | tar --null -czf "${GITHUB_WORKSPACE}/susfs-rejects.tar.gz" --files-from=- 2>/dev/null || true
+              echo "SUSFS_REJ_COUNT=${SUSFS_REJ_COUNT}" >> $GITHUB_ENV
+            else
+              echo "SUSFS_REJ_COUNT=0" >> $GITHUB_ENV
+            fi
             echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/gki_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/gki_defconfig
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/gki_defconfig
@@ -496,6 +504,14 @@ jobs:
           path: resolved_defconfig.txt
           if-no-files-found: warn
 
+      - name: Upload SUSFS reject files (if any)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: susfs-rejects-${{ inputs.ksu_type }}
+          path: ${{ github.workspace }}/susfs-rejects.tar.gz
+          if-no-files-found: ignore
+
       - name: Build Re-Kernel (eBPF)
         if: ${{ inputs.rekernel_ebpf }}
         run: |
@@ -573,7 +589,11 @@ jobs:
           fi
 
           if [[ "${{ inputs.susfs }}" == true ]]; then
-            susfs_checkbox="Supported (susfs4ksu@${SUSFS_COMMIT})"
+            if [[ "${SUSFS_REJ_COUNT:-0}" -gt 0 ]]; then
+              susfs_checkbox="Partially supported (susfs4ksu@${SUSFS_COMMIT} - ${SUSFS_REJ_COUNT} hunk(s) didn't apply, see susfs-rejects artifact)"
+            else
+              susfs_checkbox="Supported (susfs4ksu@${SUSFS_COMMIT})"
+            fi
           else
             susfs_checkbox="Unsupported"
           fi
