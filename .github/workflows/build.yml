@@ -7,15 +7,16 @@ on:
         description: "Kernel source repo URL for marble (Melt Kernel). Paste any git URL here to override the default."
         required: true
         type: string
-        default: "https://github.com/kingD2N/kernel_source_Melt_xiaomi_ingres"
+        default: "https://github.com/kingD2N/D8G_Kernel_Ingres/tree/13/arch"
 
       kernel_branch:
         description: "Branch on kernel_source above"
         required: true
         type: choice
-        default: "melt-rebase-4LazyGoogle"
+        default: "13"
         options:
           - LazyGoogle_ORI
+          - 13
           - melt-rebase-4LazyGoogle
           - melt-MIX
           - melt-rebase-hyperos
