@@ -4,10 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       kernel_source:
-        description: "Kernel source repo URL for marble (Melt Kernel). Paste any git URL here to override the default."
+        description: "Kernel source repo URL for POCO F4 GT (ingres). Paste any git URL here to override the default."
         required: true
         type: string
-        default: "https://github.com/kingD2N/D8G_Kernel_Ingres/tree/13/arch"
+        default: "https://github.com/kingD2N/D8G_Kernel_Ingres"
 
       kernel_branch:
         description: "Branch on kernel_source above"
@@ -115,7 +115,7 @@ jobs:
 
       - name: Free up disk space
         run: |
-          
+
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           df -h
@@ -147,7 +147,7 @@ jobs:
 
       - name: Clone Kernel Source
         run: |
-          git clone --depth=1 -b ${{ inputs.kernel_branch }} ${{ inputs.kernel_source }} ${SOC}
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_source }}" "${SOC}"
 
           DT_SOURCE="https://github.com/kingD2N/android13_kernel_qcom_sm8450-devicetrees"
           DT_BRANCH="lineage-20"
@@ -186,7 +186,7 @@ jobs:
           mkdir -p toolchains
           cd toolchains
 
-          
+
           LLVM_TAG=$(gh release list --repo llvm/llvm-project --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
           if [[ -z "$LLVM_TAG" ]]; then
             echo "::error::Could not determine the latest llvm/llvm-project release tag via gh CLI."
@@ -203,11 +203,11 @@ jobs:
             exit 1
           fi
 
-          
+
           mkdir llvm
           tar -xf "${ASSET}" -C llvm --strip-components=1
 
-      
+
       - name: Configure ccache dir and key
         run: |
           echo "CCACHE_DIR=$HOME/.ccache_ingres" >> $GITHUB_ENV
@@ -310,7 +310,7 @@ jobs:
           esac
 
           if [[ "${{ inputs.susfs }}" == true ]]; then
-            
+
             git clone -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git susfs
             cd susfs
 
@@ -363,7 +363,7 @@ jobs:
           if [[ "${{ inputs.BBG }}" == true ]]; then
             wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
             echo "CONFIG_BBG=y" >> arch/arm64/configs/gki_defconfig
-            sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+            sed -i '/^config LSM$/,/^[[:space:]]*help[[:space:]]*$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
           fi
 
           if [[ "${{ inputs.rekernel_netlink }}" == true ]]; then
@@ -374,7 +374,7 @@ jobs:
           fi
 
           if [[ "${{ inputs.rekernel_ebpf }}" == true ]]; then
-            
+
             echo "CONFIG_BPF_SYSCALL=y" >> arch/arm64/configs/gki_defconfig
             echo "CONFIG_BPF_JIT=y" >> arch/arm64/configs/gki_defconfig
             echo "CONFIG_CGROUP_BPF=y" >> arch/arm64/configs/gki_defconfig
@@ -434,7 +434,17 @@ jobs:
 
           echo "CONFIG_TMPFS_XATTR=y" >> arch/arm64/configs/gki_defconfig
 
-          make O=out gki_defconfig vendor/waipio_GKI.config vendor/xiaomi_GKI.config vendor/ingres_GKI.config vendor/debugfs.config ${DROIDSPACES_CONFIG}
+
+          CONFIG_FRAGMENTS="gki_defconfig"
+          for frag in vendor/waipio_GKI.config vendor/xiaomi_GKI.config vendor/ingres_GKI.config vendor/debugfs.config; do
+            if [[ -f "arch/arm64/configs/${frag}" ]]; then
+              CONFIG_FRAGMENTS="${CONFIG_FRAGMENTS} ${frag}"
+            else
+              echo "::warning::Config fragment '${frag}' not found in this kernel_source tree - skipping it (not every kernel_source ships every fragment)."
+            fi
+          done
+
+          make O=out ${CONFIG_FRAGMENTS} ${DROIDSPACES_CONFIG}
 
           echo "::group::Sanity-check defconfig (savedefconfig)"
 
@@ -465,7 +475,7 @@ jobs:
           done
           echo "::endgroup::"
 
-          
+
           make -j$(nproc) O=out CC="ccache ${CLANG_ROOT}/clang" HOSTCC="ccache ${CLANG_ROOT}/clang" Image
 
           echo "ccache status after build:"
@@ -491,11 +501,11 @@ jobs:
         run: |
           set -e
 
-          
+
           mkdir -p rekernel-ebpf-build
           cd rekernel-ebpf-build
 
-          
+
           curl -sSL -o bpftool.tar.gz \
             https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz
           mkdir -p bpftool-bin
