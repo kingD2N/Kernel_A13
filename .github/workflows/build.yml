@@ -622,7 +622,8 @@ jobs:
 
           # patch: ketat dulu (tanpa fuzz); kalau gagal baru toleransi fuzz bawaan patch + peringatan
           apply_patch() {  # <direktori> <file patch> <label>
-            local d=$1 p=$2 label=$3
+            local d=$1 p=$2 label=$3 n0
+            n0=$(grep -c 'succeeded at' "$LOG" || true)
             echo "== $label" >> "$LOG"
             if ( cd "$d" && patch -p1 -F0 --dry-run --no-backup-if-mismatch < "$p" ) >> "$LOG" 2>&1; then
               ( cd "$d" && patch -p1 -F0 --no-backup-if-mismatch < "$p" ) >> "$LOG" 2>&1
@@ -634,8 +635,18 @@ jobs:
               grep -E 'FAILED|can.t find file|No such file' "$LOG" | tail -n 40 || true
               return 1
             fi
-            echo "$label: OK ($(grep -c 'succeeded at' "$LOG" || true) hunk bergeser/offset)"
+            echo "$label: OK ($(( $(grep -c 'succeeded at' "$LOG" || true) - n0 )) hunk bergeser/offset)"
           }
+
+          # file .rej/.orig yang SUDAH ada di tree sebelum patch (mis. Makefile.rej yang ter-commit di repo kernel)
+          # bukan kesalahan patch SUSFS: dicatat dulu, setelah patch hanya file BARU yang dianggap masalah.
+          # (find -H = ikuti symlink pada argumen, jadi tetap benar walau direktori kernel berupa symlink)
+          rejscan() { find -H "$K" \( -path "$K/out" -o -name .git \) -prune -o \( -name '*.rej' -o -name '*.orig' \) -print | LC_ALL=C sort; }
+          rejscan > "$W/rej-before.txt"
+          if [ -s "$W/rej-before.txt" ]; then
+            echo "catatan: $(wc -l < "$W/rej-before.txt") file .rej/.orig sudah ada di tree sebelum patch (bawaan repo, diabaikan):"
+            head -n 5 "$W/rej-before.txt" | sed 's#^#  #'
+          fi
 
           cp "$S"/kernel_patches/fs/* "$K/fs/"
           cp "$S"/kernel_patches/include/linux/* "$K/include/linux/"
@@ -647,9 +658,11 @@ jobs:
           fi
           # objek yang tersentuh patch SUSFS -> dikompilasi lebih awal oleh step "Pra-cek KernelSU <-> SUSFS"
           { echo "fs/susfs.c"; sed -n 's#^diff --git a/\(.*\.c\) b/.*#\1#p' "$P"; } | sort -u | sed 's/\.c$/.o/' > "$W/susfs-objs.txt"
-          if find "$K" -path "$K/out" -prune -o \( -name '*.rej' -o -name '*.orig' \) -print | grep -q .; then
-            echo "::error::ada file .rej/.orig setelah patch"
-            find "$K" -path "$K/out" -prune -o \( -name '*.rej' -o -name '*.orig' \) -print
+          rejscan > "$W/rej-after.txt"
+          new=$(LC_ALL=C comm -13 "$W/rej-before.txt" "$W/rej-after.txt")
+          if [ -n "$new" ]; then
+            echo "::error::patch SUSFS meninggalkan file .rej/.orig baru (hunk tidak cocok dengan tree):"
+            echo "$new"
             exit 1
           fi
 
