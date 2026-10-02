@@ -1,658 +1,1045 @@
-name: Compile Kernel Melt Rebase - POCO F4 GT (Ingres) - AOSP13 [Lineage-20 DT]
+name: Build Kernel ingres (SM8450 5.10) + KernelSU + SUSFS
+
+# Layout build (tiga repo sejajar, dibutuhkan kernel tree):
+#   src/kernel               <- kernel tree; arch/arm64/boot/dts/vendor -> ../../../../../sm8450-devicetrees
+#   src/sm8450-devicetrees   <- DT yang dibangun (default: kingD2N/android13_kernel_qcom_sm8450-devicetrees, lineage-20)
+#   src/sm8450-modules       <- hanya untuk header DT audio/camera (bindings/*.h, dt-bindings/msm-camera.h)
+#   src/kernel/KernelSU      <- (opsional) varian KernelSU, di-symlink ke drivers/kernelsu
+#   susfs4ksu                <- (opsional) patch SUSFS; cabang dipilih otomatis sesuai versi/lineage kernel
+#   ci                       <- repo workflow ini (sparse), hanya folder tools/ AnyKernel3 milik Anda
+#
+# Output: zip AnyKernel3 (hanya mengganti kernel Image di partisi boot; ramdisk & DTB tidak disentuh),
+#         plus Image, .config, modules, dan DTB/DTBO hasil compile DT di artifact "-extras".
+#
+# Folder tools/ AnyKernel3 Anda (ak3-core.sh, busybox, magiskboot, ...): taruh di root repo ini
+# (sejajar folder .github). Kalau tidak ada, dipakai tools bawaan template AnyKernel3.
+#
+# Pra-cek SUSFS: sebelum build penuh, objek yang tersentuh patch SUSFS + driver KernelSU dikompilasi (+-2 menit) lalu
+# simbol ksu_*/susfs_* diperiksa. KernelSU dan SUSFS yang beda versi berhenti di sini, bukan setelah build berjam-jam.
+# Status kombinasi (diuji 2 Okt 2026 pada Tree_ingres 5.10.256: kompilasi + resolusi simbol; BELUM diuji runtime di perangkat):
+#   resukisu + SUSFS       OK (default)
+#   kernelsu + SUSFS       OK (patch KernelSU dari susfs4ksu)
+#   kernelsu-next + SUSFS  OK (fork pershoot, branch dev-susfs)
+#   sukisu-ultra + SUSFS   DITOLAK pra-cek (branch builtin belum sinkron dengan SUSFS v2.3.0); tanpa SUSFS OK
+#   kowsu                  hanya tanpa SUSFS
+#
+# Secret opsional:
+#   CHECKOUT_TOKEN : PAT kalau salah satu repo input private
+#   RELEASE_TOKEN  : PAT kalau mengisi release_repo
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_source:
-        description: "Kernel source repo URL for POCO F4 GT (ingres). Paste any git URL here to override the default."
-        required: true
-        type: string
-        default: "https://github.com/kingD2N/D8G_Kernel_Ingres"
-
-      kernel_branch:
-        description: "Branch on kernel_source above"
-        required: true
-        type: choice
-        default: "13"
-        options:
-          - LazyGoogle_ORI
-          - 13
-          - melt-rebase-4LazyGoogle
-          - melt-MIX
-          - melt-rebase-hyperos
-          - melt
-          - xiaomi
-          - MIUI HOS
-
-      ksu_type:
-        description: "KernelSU Version"
-        required: true
-        type: choice
-        default: "KernelSU-Next"
-        options:
-          - None
-          - Official-KernelSU
-          - KernelSU-Next
-          - KowSU
-          - ReSukiSU
-          - SukiSUUltra
-
-      custom_name:
-        description: "kernel"
+      ksu_variant:
+        description: "Varian root. none = tanpa KernelSU/SUSFS. kowsu tidak mendukung SUSFS. sukisu-ultra + SUSFS bisa ditolak pra-cek (lihat catatan di atas)"
         required: false
+        default: "resukisu"
         type: choice
-        default: AOSP13-KERNEL
         options:
-          - AOSP13-KERNEL
-          - Melt-KERNEL
-          - MIX™-KERNEL
-          - LazyGoogle-KERNEL
-
+          - resukisu
+          - sukisu-ultra
+          - kernelsu-next
+          - kernelsu
+          - kowsu
+          - none
       susfs:
-        description: "Add susfs support"
-        required: true
-        type: boolean
-        default: true
-
-      susfs_commit:
-        description: "Custom commit SHA for susfs4ksu (optional; leave empty to use the latest commit on gki-android12-5.10)"
+        description: "Tambahkan SUSFS (patch kernel + integrasi sesuai varian; cabang SUSFS dipilih otomatis)"
         required: false
+        default: true
+        type: boolean
+      lto:
+        description: "default = ikut defconfig (ThinLTO+CFI, lambat) | none = matikan LTO+CFI (jauh lebih cepat, untuk iterasi)"
+        required: false
+        default: "default"
+        type: choice
+        options:
+          - default
+          - none
+      kernel_repo:
+        description: "owner/repo kernel tree (msm-kernel 5.10; harus punya symlink dts/vendor -> ../../../../../sm8450-devicetrees)"
+        required: false
+        default: "kingD2N/Tree_ingres"
         type: string
+      kernel_branch:
+        description: "Branch kernel tree"
+        required: false
+        default: "Ingres_tree"
+        type: string
+      dt_repo:
+        description: "owner/repo devicetree yang dibangun"
+        required: false
+        default: "kingD2N/android13_kernel_qcom_sm8450-devicetrees"
+        type: string
+      dt_branch:
+        description: "Branch DT. Pakai lineage-20 (berisi waipio/SM8450). lineage-23.2-6.6 tidak punya DT SM8450 -> build ditolak"
+        required: false
+        default: "lineage-20"
+        type: string
+      modules_repo:
+        description: "owner/repo sm8450-modules (hanya dipakai untuk header DT audio/camera)"
+        required: false
+        default: "LineageOS/android_kernel_xiaomi_sm8450-modules"
+        type: string
+      modules_branch:
+        description: "Branch sm8450-modules"
+        required: false
+        default: "lineage-23.2"
+        type: string
+      defconfig_fragments:
+        description: "Fragment di arch/arm64/configs yang digabung di atas gki_defconfig (urutan penting, yang belakang menang)"
+        required: false
+        default: "vendor/waipio_GKI.config vendor/xiaomi_GKI.config vendor/ingres_GKI.config"
+        type: string
+      ksu_repo:
+        description: "Opsional: timpa owner/repo KernelSU untuk varian terpilih (kosong = default varian)"
+        required: false
         default: ""
-
-      BBG:
-        description: "Add BBG support"
-        required: true
-        type: boolean
+        type: string
+      ksu_ref:
+        description: "Opsional: branch / tag / SHA KernelSU untuk pin (kosong = ujung branch default varian)"
+        required: false
+        default: ""
+        type: string
+      susfs_branch:
+        description: "auto = pilih cabang susfs4ksu yang paling cocok dengan tree | atau nama cabang, mis. gki-android12-5.10"
+        required: false
+        default: "auto"
+        type: string
+      susfs_commit:
+        description: "Opsional: pin commit SUSFS (SHA). Kosong = ujung cabang"
+        required: false
+        default: ""
+        type: string
+      susfs_repo:
+        description: "Opsional: URL git susfs4ksu. Kosong = gitlab.com/simonpunk/susfs4ksu (fallback otomatis ke mirror GitHub)"
+        required: false
+        default: ""
+        type: string
+      ak3_tools_dir:
+        description: "Folder tools/ AnyKernel3 di repo ini (relatif root repo). Kosong atau tidak ada = tools bawaan template"
+        required: false
+        default: "tools"
+        type: string
+      llvm_version:
+        description: "system = clang-18 dari apt (tervalidasi) | auto = LLVM rilis terbaru | angka, mis. 18.1.8"
+        required: false
+        default: "system"
+        type: string
+      build_modules:
+        description: "Build + paketkan modules (.ko)"
+        required: false
         default: true
-
-      rekernel_netlink:
-        description: "Add Re-Kernel support (Netlink)"
-        required: true
         type: boolean
+      ccache:
+        description: "Pakai ccache (mempercepat build ulang)"
+        required: false
         default: true
-
-      rekernel_ebpf:
-        description: "Add Re-Kernel support (eBPF)"
-        required: true
         type: boolean
-        default: true
+      localversion:
+        description: "Opsional: timpa CONFIG_LOCALVERSION (mis. -Templar). Kosong = ikut defconfig"
+        required: false
+        default: ""
+        type: string
+      kernel_name:
+        description: "Nama kernel untuk nama zip / release"
+        required: false
+        default: "Ingres-Kernel"
+        type: string
+      extra_make_args:
+        description: "Argumen make tambahan, pisah spasi (mis. KCFLAGS=-Wno-error)"
+        required: false
+        default: ""
+        type: string
+      release_repo:
+        description: "owner/repo untuk GitHub Release (kosong = upload artifact)"
+        required: false
+        default: ""
+        type: string
 
-      droidspaces:
-        description: "Add DroidSpaces support"
-        required: true
-        type: boolean
-        default: true
+permissions:
+  contents: read
 
-      nomount:
-        description: "Add NoMount support (kernel VFS path redirection/injection, maxsteeel/nomount@master - auto-updates to whatever's newest on that branch each run; may conflict with susfs since both patch fs/namei.c)"
-        required: true
-        type: boolean
-        default: true
+concurrency:
+  group: build-kernel-ingres-${{ github.ref }}
+  cancel-in-progress: false
 
-      ccache_update:
-        description: "Refresh ccache (overwrite the repo cache with this build's ccache; enable when u changed configs/source or need a clean cache)"
-        required: true
-        type: boolean
-        default: true
+defaults:
+  run:
+    shell: bash
 
+env:
+  # ---- default yang bisa diubah di sini ----
+  TARGET_DEVICE: ingres
+  AK3_REPO: osm0sis/AnyKernel3
+  AK3_SHA: 020dfeccf9d7e962a48400fc94d3e451df92eead
+  SUSFS_DEFAULT_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_MIRROR_REPO: https://github.com/ShirkNeko/susfs4ksu.git
+  KBUILD_BUILD_USER: kingD2N
+  KBUILD_BUILD_HOST: github-actions
+  CCACHE_COMPILERCHECK: content
+  # ---- input -> env (dipakai script; tidak ada ${{ }} di dalam blok run) ----
+  KERNEL_REPO: ${{ inputs.kernel_repo }}
+  KERNEL_BRANCH: ${{ inputs.kernel_branch }}
+  DT_REPO: ${{ inputs.dt_repo }}
+  DT_BRANCH: ${{ inputs.dt_branch }}
+  MODULES_REPO: ${{ inputs.modules_repo }}
+  MODULES_BRANCH: ${{ inputs.modules_branch }}
+  DEFCONFIG_FRAGMENTS: ${{ inputs.defconfig_fragments }}
+  KSU_VARIANT: ${{ inputs.ksu_variant }}
+  USE_SUSFS: ${{ inputs.susfs }}
+  KSU_REPO_IN: ${{ inputs.ksu_repo }}
+  KSU_REF_IN: ${{ inputs.ksu_ref }}
+  SUSFS_BRANCH_IN: ${{ inputs.susfs_branch }}
+  SUSFS_COMMIT_IN: ${{ inputs.susfs_commit }}
+  SUSFS_REPO_IN: ${{ inputs.susfs_repo }}
+  AK3_TOOLS_DIR: ${{ inputs.ak3_tools_dir }}
+  LLVM_VERSION: ${{ inputs.llvm_version }}
+  LTO: ${{ inputs.lto }}
+  BUILD_MODULES: ${{ inputs.build_modules }}
+  USE_CCACHE: ${{ inputs.ccache }}
+  LOCALVERSION_OVERRIDE: ${{ inputs.localversion }}
+  KERNEL_NAME: ${{ inputs.kernel_name }}
+  EXTRA_MAKE_ARGS: ${{ inputs.extra_make_args }}
 
 jobs:
-  Build_Kernel:
-    env:
-        GH_TOKEN: ${{ github.token }}
-        SOC: sm8450
-        CCACHE_KEY: ccache-ecsv3-ingres-sm8450-aosp13
-        # Public link of your Telegram group (shown as "JOIN" button in the push).
-        TG_GROUP_URL: ""
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
-      checks: read
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Free up disk space
+      - name: Tentukan opsi KernelSU / SUSFS
         run: |
+          set -euo pipefail
+          ksu_on=true
+          susfs_on=false
+          if [ "$KSU_VARIANT" = none ]; then
+            ksu_on=false
+            if [ "$USE_SUSFS" = true ]; then
+              echo "::notice::ksu_variant=none -> SUSFS dilewati (SUSFS hanya berguna bersama KernelSU)"
+            fi
+          elif [ "$USE_SUSFS" = true ]; then
+            susfs_on=true
+          fi
+          if [ "$KSU_VARIANT" = kowsu ] && [ "$susfs_on" = true ]; then
+            echo "::error::KowSU tidak mendukung SUSFS. Matikan input susfs atau pilih varian lain."
+            exit 1
+          fi
 
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-          df -h
+          # validasi input yang dipakai sebagai argumen git / path
+          valid() { [[ "$2" =~ $1 ]] || { echo "::error::nilai input tidak valid: $3 = '$2'"; exit 1; }; }
+          if [ -n "$KSU_REPO_IN" ];    then valid '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' "$KSU_REPO_IN" ksu_repo; fi
+          if [ -n "$KSU_REF_IN" ];     then valid '^[A-Za-z0-9][A-Za-z0-9._/-]*$' "$KSU_REF_IN" ksu_ref; fi
+          if [ -n "$SUSFS_COMMIT_IN" ]; then valid '^[0-9a-f]{7,40}$' "$SUSFS_COMMIT_IN" susfs_commit; fi
+          if [ -n "$SUSFS_BRANCH_IN" ]; then valid '^[A-Za-z0-9][A-Za-z0-9._/-]*$' "$SUSFS_BRANCH_IN" susfs_branch; fi
+          if [ -n "$AK3_TOOLS_DIR" ];  then
+            valid '^[A-Za-z0-9._/-]+$' "$AK3_TOOLS_DIR" ak3_tools_dir
+            case "/$AK3_TOOLS_DIR/" in
+              */../*|//*) echo "::error::ak3_tools_dir tidak boleh memakai '..' atau diawali '/'"; exit 1 ;;
+            esac
+          fi
 
-      - name: Setup SWAP
-        uses: pierotofy/set-swap-space@master
+          {
+            echo "KSU_ON=$ksu_on"
+            echo "SUSFS_ON=$susfs_on"
+          } >> "$GITHUB_ENV"
+          echo "KernelSU: $ksu_on ($KSU_VARIANT) | SUSFS: $susfs_on"
+
+      - name: Kosongkan disk runner
+        uses: jlumbroso/free-disk-space@v2
         with:
-          swap-size-gb: 16
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
 
-      - name: Install build dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y \
-          bc bison flex \
-          libssl-dev \
-          libelf-dev \
-          libdw-dev \
-          build-essential \
-          lz4 \
-          git \
-          python3 \
-          curl \
-          dwarves \
-          cpio \
-          ccache \
-          zstd \
-          unzip \
-          gcc-aarch64-linux-gnu
-
-      - name: Clone Kernel Source
-        run: |
-          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_source }}" "${SOC}"
-
-          DT_SOURCE="https://github.com/kingD2N/android13_kernel_qcom_sm8450-devicetrees"
-          DT_BRANCH="lineage-20"
-          echo "==> Devicetree (locked to lineage-20): ${DT_SOURCE} @ ${DT_BRANCH}"
-          echo "DT_SOURCE=${DT_SOURCE}" >> $GITHUB_ENV
-          echo "DT_BRANCH=${DT_BRANCH}" >> $GITHUB_ENV
-
-          rm -rf ${SOC}/arch/arm64/boot/dts/vendor
-          git clone --depth=1 -b "${DT_BRANCH}" "${DT_SOURCE}" ${SOC}/arch/arm64/boot/dts/vendor \
-            || git clone --depth=1 "${DT_SOURCE}" ${SOC}/arch/arm64/boot/dts/vendor
-
-      - name: Detect kernel version
-        run: |
-
-          KVERSION=$(grep -m1 '^VERSION = ' ${SOC}/Makefile | awk '{print $3}')
-          KPATCHLEVEL=$(grep -m1 '^PATCHLEVEL = ' ${SOC}/Makefile | awk '{print $3}')
-          KSUBLEVEL=$(grep -m1 '^SUBLEVEL = ' ${SOC}/Makefile | awk '{print $3}')
-
-          if [[ -z "$KVERSION" || -z "$KPATCHLEVEL" || -z "$KSUBLEVEL" ]]; then
-            echo "::error::Couldn't parse VERSION/PATCHLEVEL/SUBLEVEL from ${SOC}/Makefile (got '${KVERSION}.${KPATCHLEVEL}.${KSUBLEVEL}'). Has the Makefile's header format changed on this branch?"
-            exit 1
-          fi
-
-          # KERNEL_BASE intentionally stays "android12" here even though this workflow
-          # targets an AOSP Android 13 build: ingres shipped on Android 12, so per Google's
-          # GKI KMI policy it is permanently locked to the android12-5.10 kernel base -
-          # vendor .ko blobs are compiled against that ABI regardless of which Android
-          # version the ROM on top is running. This workflow's devicetree is locked to
-          # kingD2N's lineage-20 tree; that lock has no effect on the GKI base above.
-          KERNEL_BASE="android12-${KVERSION}.${KPATCHLEVEL}.${KSUBLEVEL}"
-          echo "==> Detected kernel version: ${KERNEL_BASE}"
-          echo "KERNEL_BASE=${KERNEL_BASE}" >> $GITHUB_ENV
-
-      - name: Download LLVM (latest stable release)
-        run: |
-          mkdir -p toolchains
-          cd toolchains
-
-
-          LLVM_TAG=$(gh release list --repo llvm/llvm-project --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
-          if [[ -z "$LLVM_TAG" ]]; then
-            echo "::error::Could not determine the latest llvm/llvm-project release tag via gh CLI."
-            exit 1
-          fi
-          LLVM_VERSION="${LLVM_TAG#llvmorg-}"
-          echo "==> Latest LLVM release: ${LLVM_TAG} (version ${LLVM_VERSION})"
-          echo "LLVM_VERSION=${LLVM_VERSION}" >> $GITHUB_ENV
-
-          ASSET="LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
-          URL="https://github.com/llvm/llvm-project/releases/download/${LLVM_TAG}/${ASSET}"
-          if ! wget -q "$URL"; then
-            echo "::error::Failed to download ${URL} - ${LLVM_TAG} may not publish a Linux-X64 tarball under the expected name. Check https://github.com/llvm/llvm-project/releases/tag/${LLVM_TAG} for the actual asset name."
-            exit 1
-          fi
-
-
-          mkdir llvm
-          tar -xf "${ASSET}" -C llvm --strip-components=1
-
-
-      - name: Configure ccache dir and key
-        run: |
-          echo "CCACHE_DIR=$HOME/.ccache_ingres" >> $GITHUB_ENV
-          echo "CCACHE_MAXSIZE=3G" >> $GITHUB_ENV
-          if [[ "${{ inputs.droidspaces }}" == true ]]; then
-            CCACHE_REAL_KEY=${CCACHE_KEY}-Droidspaces
-          else
-            CCACHE_REAL_KEY=${CCACHE_KEY}-none
-          fi
-          echo "CCACHE_REAL_KEY=$CCACHE_REAL_KEY" >> $GITHUB_ENV
-
-      - name: Purge old ccache (on refresh)
-        if: ${{ inputs.ccache_update }}
-        continue-on-error: true
-        run: |
-          echo "Deleting old repo ccache to force a fresh save..."
-          gh cache delete "${CCACHE_REAL_KEY}-${{ runner.os }}-${{ inputs.kernel_branch }}" -R ${{ github.repository }} || echo "No old ccache to delete"
-
-      - name: Restore ccache
-        uses: actions/cache/restore@v6
-        id: ccache-restore
+      - name: Checkout kernel tree
+        uses: actions/checkout@v7
         with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ inputs.kernel_branch }}
-          restore-keys: |
-            ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-
-            ${{ env.CCACHE_REAL_KEY }}-
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_branch }}
+          path: src/kernel
+          token: ${{ secrets.CHECKOUT_TOKEN || github.token }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Compile Kernel
+      - name: Checkout devicetree
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.dt_repo }}
+          ref: ${{ inputs.dt_branch }}
+          path: src/sm8450-devicetrees
+          token: ${{ secrets.CHECKOUT_TOKEN || github.token }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout sm8450-modules (header DT)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.modules_repo }}
+          ref: ${{ inputs.modules_branch }}
+          path: src/sm8450-modules
+          token: ${{ secrets.CHECKOUT_TOKEN || github.token }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout repo ini (folder tools AnyKernel3)
+        if: ${{ inputs.ak3_tools_dir != '' }}
+        uses: actions/checkout@v7
+        with:
+          path: ci
+          sparse-checkout: ${{ inputs.ak3_tools_dir }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Cek layout kernel + DT + modules
         run: |
-          CLANG_ROOT="${GITHUB_WORKSPACE}/toolchains/llvm/bin"
-          export PATH="${CLANG_ROOT}:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export LLVM=1
-          export LLVM_IAS=1
-          export CC="${CLANG_ROOT}/clang"
-          export CXX="${CLANG_ROOT}/clang++"
-          export HOSTCC="${CLANG_ROOT}/clang"
-          export HOSTCXX="${CLANG_ROOT}/clang++"
-          export LD="${CLANG_ROOT}/ld.lld"
-          export AR="${CLANG_ROOT}/llvm-ar"
-          export NM="${CLANG_ROOT}/llvm-nm"
-          export OBJCOPY="${CLANG_ROOT}/llvm-objcopy"
-          export OBJDUMP="${CLANG_ROOT}/llvm-objdump"
-          export STRIP="${CLANG_ROOT}/llvm-strip"
-          export KBUILD_BUILD_USER="KingD2N"
-          export KBUILD_BUILD_HOST="Ingres"
+          set -euo pipefail
+          K=src/kernel; DT=src/sm8450-devicetrees; MOD=src/sm8450-modules
 
-
-          export CCACHE_COMPILERCHECK="none"
-          export CCACHE_BASEDIR="${GITHUB_WORKSPACE}"
-          export CCACHE_NOHASHDIR="true"
-          export CCACHE_NOHARDLINK="true"
-          mkdir -p "${CCACHE_DIR}"
-          echo "sloppiness = file_stat_matches,include_file_ctime,include_file_mtime,pch_defines,file_macro,time_macros" >> "${CCACHE_DIR}/ccache.conf"
-          ccache -M "${CCACHE_MAXSIZE}"
-          ccache -o compression=true
-          echo "ccache status before build:"
-          ccache -s
-
-          if [[ -n "${{ inputs.custom_name }}" ]]; then
-            KERNEL_NAME="${{ inputs.custom_name }}"
+          # kernel tree mengharapkan DT sebagai sibling bernama sm8450-devicetrees
+          link="$K/arch/arm64/boot/dts/vendor"
+          if [ -L "$link" ]; then
+            echo "dts/vendor -> $(readlink "$link")"
+          elif [ -e "$link" ]; then
+            echo "::error::$link bukan symlink. Kernel tree ini membawa DT sendiri, tidak cocok untuk workflow ini."
+            exit 1
           else
-            KERNEL_NAME="${{ inputs.ksu_type }}"
+            ln -s ../../../../../sm8450-devicetrees "$link"
+            echo "symlink dts/vendor tidak ada di kernel tree -> dibuat otomatis"
+          fi
+          if [ "$(readlink -f "$link")" != "$(readlink -f "$DT")" ]; then
+            echo "::error::symlink dts/vendor menunjuk ke '$(readlink "$link")', bukan ke sm8450-devicetrees."
+            exit 1
           fi
 
-          echo "KERNEL_NAME=${KERNEL_NAME}" >> $GITHUB_ENV
+          # DT harus punya platform SM8450 (waipio)
+          if [ ! -f "$DT/qcom/waipio.dtsi" ]; then
+            echo "::error::Branch DT '$DT_BRANCH' tidak punya qcom/waipio.dtsi (SM8450). Branch ini bukan DT SM8450 (mis. lineage-23.2-6.6 hanya berisi DT KERNEL.PLATFORM.4.0/VM). Pakai lineage-20."
+            exit 1
+          fi
 
-          cd ${SOC}
+          # header DT audio/camera: <bindings/qcom,audio-ext-clk.h>, <dt-bindings/msm-camera.h>
+          inc=$(find "$PWD/$MOD" -type d \( -name dt-bindings -o -path '*/include/bindings' \) -not -path '*/Documentation/*' \
+                | sed -E 's#/(dt-bindings|bindings)$##' | sort -u | tr '\n' ' ')
+          [ -n "$inc" ] || { echo "::error::tidak ada header DT (dt-bindings / include/bindings) di repo modules"; exit 1; }
+          echo "DTC_INC=$inc" >> "$GITHUB_ENV"
+          echo "header DT dari: $inc"
 
-          case "${{ inputs.ksu_type }}" in
-
-            "None")
-              ;;
-
-            "Official-KernelSU")
-              curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-              ;;
-
-            "KowSU")
-               curl -LSs "https://raw.githubusercontent.com/KOWX712/KernelSU/main/kernel/setup.sh" | bash -s master
-              ;;
-
-            "KernelSU-Next")
-              if [[ "${{ inputs.susfs }}" == true ]]; then
-                curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
-              else
-                curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s dev
-              fi
-              ;;
-
-            "ReSukiSU")
-              curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash
-              ;;
-
-            "SukiSUUltra")
-              curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
-              ;;
+          ver=$(head -n 8 "$K/Makefile" | awk -F' *= *' '/^VERSION/{v=$2} /^PATCHLEVEL/{p=$2} /^SUBLEVEL/{s=$2} END{print v"."p"."s}')
+          case "$ver" in
+            5.10.*) ;;
+            *) echo "::warning::kernel tree versi $ver (bukan 5.10.x); flag build di workflow ini divalidasi untuk 5.10" ;;
           esac
 
-          if [[ "${{ inputs.susfs }}" == true ]]; then
+          # petunjuk lineage ACK dari tree (mis. android12-5.10); dipakai sebagai tie-breaker pemilihan cabang SUSFS
+          hint=$(grep -hoE '^BRANCH=android[0-9]+-[0-9]+\.[0-9]+' "$K"/build.config.common "$K"/build.config.gki 2>/dev/null | head -n 1 | cut -d= -f2 || true)
 
-            git clone -b gki-android12-5.10 https://gitlab.com/simonpunk/susfs4ksu.git susfs
-            cd susfs
-
-            if [[ -n "${{ inputs.susfs_commit }}" ]]; then
-              echo "==> SUSFS: pinning to custom commit ${{ inputs.susfs_commit }}"
-              git checkout "${{ inputs.susfs_commit }}"
-            else
-              echo "==> SUSFS: using latest commit on branch gki-android12-5.10"
-            fi
-
-            SUSFS_COMMIT=$(git rev-parse --short HEAD)
-            echo "SUSFS_COMMIT=${SUSFS_COMMIT}" >> $GITHUB_ENV
-            echo "==> SUSFS: checked out commit ${SUSFS_COMMIT}"
-            cp ./kernel_patches/50_add_susfs_in_gki-android12-5.10.patch ..
-            cp ./kernel_patches/fs/* ../fs/
-            cp ./kernel_patches/include/linux/* ../include/linux/
-            cd ..
-            if ! patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch; then
-              SUSFS_REJ_COUNT=$(find . -name "*.rej" | wc -l)
-              echo "::warning::SUSFS patch didn't apply 100% cleanly on this kernel_source tree (${SUSFS_REJ_COUNT} hunk(s) rejected) - continuing with what DID apply instead of failing the whole build."
-              find . -name "*.rej" -exec echo "::warning::  unapplied hunk(s) recorded in {}" \;
-              find . -name "*.rej" -print0 | tar --null -czf "${GITHUB_WORKSPACE}/susfs-rejects.tar.gz" --files-from=- 2>/dev/null || true
-              echo "SUSFS_REJ_COUNT=${SUSFS_REJ_COUNT}" >> $GITHUB_ENV
-            else
-              echo "SUSFS_REJ_COUNT=0" >> $GITHUB_ENV
-            fi
-            echo "CONFIG_KSU_SUSFS=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> arch/arm64/configs/gki_defconfig
+          # kunci string versi kernel SEBELUM tree dipatch (KernelSU/SUSFS), supaya uname -r tidak berubah jadi "-dirty"
+          if [ ! -e "$K/.scmversion" ]; then
+            (cd "$K" && scripts/setlocalversion --save-scmversion)
           fi
+          echo "scmversion: $(cat "$K/.scmversion" 2>/dev/null || true)"
 
-          if [[ "${{ inputs.nomount }}" == true ]]; then
-            echo "::group::NoMount integration"
-            if [[ "${{ inputs.susfs }}" == true ]]; then
-              echo "::warning::susfs and nomount are both enabled - susfs's SUS_KSTAT patches fs/stat.c, which nomount's own VFS hooks may also touch. If anything below fails, try disabling one to isolate it."
-            fi
+          {
+            echo "LINUX_VERSION=$ver"
+            echo "BRANCH_HINT=$hint"
+            echo "KERNEL_SHA=$(git -C "$K" rev-parse --short HEAD)"
+            echo "DT_SHA=$(git -C "$DT" rev-parse --short HEAD)"
+            echo "MOD_SHA=$(git -C "$MOD" rev-parse --short HEAD)"
+          } >> "$GITHUB_ENV"
+          echo "Linux $ver (petunjuk lineage: ${hint:-tidak ada})"
 
-
-            NOMOUNT_COMMIT=$(git ls-remote https://github.com/maxsteeel/nomount.git refs/heads/master | cut -f1 | cut -c1-7)
-            if [[ -z "$NOMOUNT_COMMIT" ]]; then
-              echo "::warning::Could not resolve maxsteeel/nomount's master branch HEAD via git ls-remote - continuing anyway, but the release notes won't show a commit hash for this run."
-              NOMOUNT_COMMIT="unknown"
-            fi
-            echo "NOMOUNT_COMMIT=${NOMOUNT_COMMIT}" >> $GITHUB_ENV
-            echo "==> NoMount: using maxsteeel/nomount@master (${NOMOUNT_COMMIT})"
-
-            curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/master/kernel/setup.sh" | bash -s master
-            echo "CONFIG_NOMOUNT=y" >> arch/arm64/configs/gki_defconfig
-            echo "::endgroup::"
-          fi
-
-          if [[ "${{ inputs.BBG }}" == true ]]; then
-            wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
-            echo "CONFIG_BBG=y" >> arch/arm64/configs/gki_defconfig
-            sed -i '/^config LSM$/,/^[[:space:]]*help[[:space:]]*$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
-          fi
-
-          if [[ "${{ inputs.rekernel_netlink }}" == true ]]; then
-            git clone --depth=1 https://github.com/Sakion-Team/Re-Kernel.git rekernel-src
-            bash rekernel-src/Integrate/patches.sh
-            echo "CONFIG_REKERNEL=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_REKERNEL_NETWORK=y" >> arch/arm64/configs/gki_defconfig
-          fi
-
-          if [[ "${{ inputs.rekernel_ebpf }}" == true ]]; then
-
-            echo "CONFIG_BPF_SYSCALL=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_BPF_JIT=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_CGROUP_BPF=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_BPF_EVENTS=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KPROBES=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_KPROBE_EVENTS=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_UPROBE_EVENTS=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_NET_CLS_ACT=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_NET_CLS_BPF=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_NET_ACT_BPF=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_NET_SCH_INGRESS=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_DEBUG_INFO=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_DEBUG_INFO_BTF=y" >> arch/arm64/configs/gki_defconfig
-            echo "CONFIG_DEBUG_INFO_BTF_MODULES=y" >> arch/arm64/configs/gki_defconfig
-            echo "==> Re-Kernel eBPF selected; will build after the kernel Image is ready."
-          fi
-
-          DROIDSPACES_CONFIG=""
-          if [[ "${{ inputs.droidspaces }}" == true ]]; then
-
-            apply_droidspaces_patch() {
-              local patch_file="$1" label="$2"
-              if patch -p1 -N --fuzz=0 --dry-run --silent < "$patch_file" > /dev/null 2>&1; then
-                patch -p1 -N --fuzz=0 < "$patch_file"
-                echo "==> DroidSpaces ${label}: applied."
-                return 0
-              elif patch -p1 -R --fuzz=0 --dry-run --silent < "$patch_file" > /dev/null 2>&1; then
-                echo "==> DroidSpaces ${label}: already present natively on this branch (confirmed via reverse-check) - not re-applying."
-                return 0
-              else
-                echo "::warning::DroidSpaces ${label} doesn't apply cleanly in either direction - can't confirm the kABI fix is actually present on this tree."
-                return 1
-              fi
-            }
-
-            DROIDSPACES_SAFE=true
-
-            curl -sLo patch-for-below-6.12.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/refs/heads/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
-            apply_droidspaces_patch patch-for-below-6.12.patch "patch 001 (sysvipc kabi fix)" || DROIDSPACES_SAFE=false
-
-            curl -sLo patch-for-5.10-or-lower.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/refs/heads/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/002.5.10_or_lower_use_android_abi_padding_for_posix_mqueue.patch
-            apply_droidspaces_patch patch-for-5.10-or-lower.patch "patch 002 (posix_mqueue abi padding)" || DROIDSPACES_SAFE=false
-
-            if [[ "$DROIDSPACES_SAFE" == true ]]; then
-              if [[ -f "${GITHUB_WORKSPACE}/configs/droidspaces-gki.config" ]]; then
-                cp ${GITHUB_WORKSPACE}/configs/droidspaces-gki.config arch/arm64/configs/vendor/droidspaces.config
-                DROIDSPACES_CONFIG="vendor/droidspaces.config"
-              else
-                echo "::warning::configs/droidspaces-gki.config not found in this repo's root - DroidSpaces config fragment not applied (nothing to enable it with). Add that file to the repo (see ravindu644/Droidspaces-OSS 'Configuring GKI Kernels' docs) to actually turn DroidSpaces on."
-              fi
-            else
-              echo "::warning::Skipping the DroidSpaces config fragment entirely this run - at least one required kABI patch could not be confirmed. Enabling CONFIG_SYSVIPC/CONFIG_IPC_NS/CONFIG_POSIX_MQUEUE without it risks a bootloop per DroidSpaces-OSS's own docs, so this run won't have working DroidSpaces support."
-            fi
-          fi
-
-          echo "-${KERNEL_NAME}-${{ github.actor }}" > .scmversion
-
-          echo "CONFIG_TMPFS_XATTR=y" >> arch/arm64/configs/gki_defconfig
-
-
-          CONFIG_FRAGMENTS="gki_defconfig"
-          for frag in vendor/waipio_GKI.config vendor/xiaomi_GKI.config vendor/ingres_GKI.config vendor/debugfs.config; do
-            if [[ -f "arch/arm64/configs/${frag}" ]]; then
-              CONFIG_FRAGMENTS="${CONFIG_FRAGMENTS} ${frag}"
-            else
-              echo "::warning::Config fragment '${frag}' not found in this kernel_source tree - skipping it (not every kernel_source ships every fragment)."
-            fi
-          done
-
-          make O=out ${CONFIG_FRAGMENTS} ${DROIDSPACES_CONFIG}
-
-          echo "::group::Sanity-check defconfig (savedefconfig)"
-
-          make O=out savedefconfig
-          cp out/defconfig "${GITHUB_WORKSPACE}/resolved_defconfig.txt"
-
-          echo "--- Cek symbol kunci ingres / tuning gaming tetap ke-resolve ---"
-          for cfg in \
-            CONFIG_ARCH_QCOM \
-            CONFIG_ARCH_WAIPIO \
-            CONFIG_SCHED_WALT \
-            CONFIG_QCOM_KGSL \
-            CONFIG_BINDER_PRIO \
-            CONFIG_MQ_IOSCHED_KYBER \
-            CONFIG_MQ_IOSCHED_DEADLINE \
-            CONFIG_HZ_500 \
-            CONFIG_KSU_SUSFS \
-            CONFIG_BBG \
-            CONFIG_REKERNEL \
-            CONFIG_NOMOUNT \
-          ; do
-            hit=$(grep "^${cfg}=" out/defconfig || true)
-            if [[ -n "$hit" ]]; then
-              echo "✅ ${hit}"
-            else
-              echo "⚠️  ${cfg} tidak ada di hasil resolve (dependency belum kepenuhi, atau symbol memang gak ada di tree ini - cek manual kalau ini config yang kamu harap ada)"
-            fi
-          done
-          echo "::endgroup::"
-
-
-          make -j$(nproc) O=out CC="ccache ${CLANG_ROOT}/clang" HOSTCC="ccache ${CLANG_ROOT}/clang" Image
-
-          echo "ccache status after build:"
-          ccache -s
-
-      - name: Save ccache
-        if: ${{ always() && steps.ccache-restore.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v6
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ inputs.kernel_branch }}
-
-      - name: Upload resolved defconfig (debug artifact)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: resolved-defconfig-${{ inputs.ksu_type }}
-          path: resolved_defconfig.txt
-          if-no-files-found: warn
-
-      - name: Upload SUSFS reject files (if any)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: susfs-rejects-${{ inputs.ksu_type }}
-          path: ${{ github.workspace }}/susfs-rejects.tar.gz
-          if-no-files-found: ignore
-
-      - name: Build Re-Kernel (eBPF)
-        if: ${{ inputs.rekernel_ebpf }}
+      - name: Install dependensi build
         run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio lz4 zstd zip unzip xz-utils rsync python3 kmod patch >/dev/null
+
+      - name: Siapkan toolchain LLVM
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tc=""
+          use_apt() {
+            sudo apt-get install -y -qq clang-18 lld-18 llvm-18 >/dev/null
+            tc=/usr/lib/llvm-18/bin
+          }
+          fetch_llvm() {
+            local tag asset assets
+            if [ "$LLVM_VERSION" = auto ]; then
+              tag=$(gh release list --repo llvm/llvm-project --limit 100 --json tagName --jq '.[].tagName' \
+                    | grep -E '^llvmorg-[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1) || return 1
+            else
+              tag="llvmorg-${LLVM_VERSION}"
+            fi
+            [ -n "$tag" ] || return 1
+            echo "LLVM release: $tag"
+            assets=$(gh release view "$tag" --repo llvm/llvm-project --json assets --jq '.assets[].name') || return 1
+            asset=$(printf '%s\n' "$assets" | grep -E '^LLVM-[0-9.]+-Linux-X64\.tar\.xz$' | head -n1 || true)
+            [ -n "$asset" ] || asset=$(printf '%s\n' "$assets" | grep -E '^clang\+llvm-[0-9.]+-x86_64-linux-gnu.*\.tar\.xz$' | head -n1 || true)
+            [ -n "$asset" ] || { echo "asset toolchain Linux x86_64 tidak ditemukan di $tag"; return 1; }
+            gh release download "$tag" --repo llvm/llvm-project --pattern "$asset" --dir "$RUNNER_TEMP" || return 1
+            mkdir -p "$HOME/llvm"
+            tar -xJf "$RUNNER_TEMP/$asset" -C "$HOME/llvm" --strip-components=1 || return 1
+            rm -f "$RUNNER_TEMP/$asset"
+            tc="$HOME/llvm/bin"
+          }
+          if [ "$LLVM_VERSION" = system ]; then
+            use_apt
+          elif ! fetch_llvm; then
+            echo "::warning::gagal ambil LLVM '$LLVM_VERSION' dari llvm-project, fallback ke clang-18 (apt)"
+            use_apt
+          fi
+          echo "$tc" >> "$GITHUB_PATH"
+          export PATH="$tc:$PATH"
+          for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
+            command -v "$t" >/dev/null || { echo "::error::$t tidak ada di $tc"; exit 1; }
+          done
+          clang --version > toolchain.txt
+          head -n 2 toolchain.txt
+
+      - name: Setup ccache
+        if: ${{ inputs.ccache }}
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: kernel-${{ env.TARGET_DEVICE }}-${{ inputs.kernel_branch }}-${{ inputs.lto }}
+          max-size: 2G
+
+      - name: Pasang KernelSU
+        if: ${{ env.KSU_ON == 'true' }}
+        run: |
+          set -euo pipefail
+          K="$GITHUB_WORKSPACE/src/kernel"
+          D="$K/KernelSU"
+
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n+1))
+              [ "$n" -ge 5 ] && return 1
+              echo "retry $n/5: $*" >&2
+              sleep 5
+            done
+          }
+
+          # varian -> repo + ref default. Dengan SUSFS dipakai build yang sudah membawa integrasi SUSFS
+          # (pola sama dengan CI referensi WildKernels/GKI_KernelSU_SUSFS):
+          #   kernelsu       : tiann/KernelSU + patch 10_enable_susfs_for_ksu.patch (dari susfs4ksu)
+          #   resukisu       : ReSukiSU main (SUSFS inline hook bawaan)
+          #   sukisu-ultra   : SukiSU-Ultra branch builtin (SUSFS bawaan)
+          #   kernelsu-next  : pershoot/KernelSU-Next branch dev-susfs (SUSFS bawaan)
+          case "$KSU_VARIANT" in
+            resukisu)
+              repo=ReSukiSU/ReSukiSU; ref=main; name=ReSukiSU ;;
+            sukisu-ultra)
+              repo=SukiSU-Ultra/SukiSU-Ultra; ref=main; name=SukiSU-Ultra
+              if [ "$SUSFS_ON" = true ]; then ref=builtin; fi ;;
+            kernelsu-next)
+              repo=KernelSU-Next/KernelSU-Next; ref=dev; name=KernelSU-Next
+              if [ "$SUSFS_ON" = true ]; then repo=pershoot/KernelSU-Next; ref=dev-susfs; fi ;;
+            kernelsu)
+              repo=tiann/KernelSU; ref=main; name=KernelSU ;;
+            kowsu)
+              repo=KOWX712/KernelSU; ref=master; name=KowSU ;;
+            *)
+              echo "::error::ksu_variant tidak dikenal: $KSU_VARIANT"; exit 1 ;;
+          esac
+          if [ -n "$KSU_REPO_IN" ]; then repo="$KSU_REPO_IN"; fi
+          if [ -n "$KSU_REF_IN" ]; then ref="$KSU_REF_IN"; fi
+
+          if [ -e "$K/drivers/kernelsu" ] || [ -e "$D" ]; then
+            echo "::error::kernel tree sudah memuat KernelSU (drivers/kernelsu atau KernelSU/). Pakai ksu_variant=none atau tree tanpa KernelSU."
+            exit 1
+          fi
+
+          echo "KernelSU: $name <- $repo @ $ref"
+          retry git clone --quiet --filter=blob:none --no-checkout "https://github.com/$repo.git" "$D" \
+            || { echo "::error::gagal clone https://github.com/$repo.git (repo tidak ada, private, atau jaringan)"; exit 1; }
+          checkout_ref() {
+            if [[ "$ref" =~ ^[0-9a-f]{7,40}$ ]]; then
+              git -C "$D" checkout --quiet --detach "$ref"
+            elif git -C "$D" rev-parse --verify --quiet "refs/remotes/origin/$ref" >/dev/null; then
+              git -C "$D" checkout --quiet -B "$ref" "origin/$ref"
+            else
+              git -C "$D" checkout --quiet --detach "$ref"
+            fi
+          }
+          checkout_ref || { echo "::error::ref '$ref' tidak ditemukan di $repo"; exit 1; }
+          # SukiSU menghitung versi dari branch lokal "main"; pastikan ada walau yang di-checkout branch lain
+          if [ "$KSU_VARIANT" = sukisu-ultra ] \
+             && ! git -C "$D" rev-parse --verify --quiet refs/heads/main >/dev/null \
+             && git -C "$D" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null; then
+            git -C "$D" branch --quiet main origin/main
+          fi
+          [ -f "$D/kernel/Kconfig" ] || { echo "::error::$repo@$ref tidak punya kernel/Kconfig (bukan repo KernelSU yang valid)"; exit 1; }
+
+          # sama seperti kernel/setup.sh upstream: symlink drivers/kernelsu + Makefile + Kconfig
+          ln -sfn ../KernelSU/kernel "$K/drivers/kernelsu"
+          # shellcheck disable=SC2016  # $(CONFIG_KSU) harus literal (sintaks Makefile), bukan diekspansi shell
+          grep -q 'kernelsu' "$K/drivers/Makefile" || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$K/drivers/Makefile"
+          python3 - "$K/drivers/Kconfig" <<'PY'
+          import sys
+          path = sys.argv[1]
+          src = 'source "drivers/kernelsu/Kconfig"'
+          lines = open(path).read().split('\n')
+          if src not in lines:
+              idx = max(i for i, l in enumerate(lines) if l.strip() == 'endmenu')
+              lines.insert(idx, src)
+              open(path, 'w').write('\n'.join(lines))
+          PY
+          grep -q 'drivers/kernelsu/Kconfig' "$K/drivers/Kconfig" || { echo "::error::gagal menyisipkan Kconfig KernelSU"; exit 1; }
+
+          sha=$(git -C "$D" rev-parse HEAD)
+          tag=$(git -C "$D" describe --tags --abbrev=0 2>/dev/null || true)
+          {
+            echo "KSU_NAME=$name"
+            echo "KSU_REPO=$repo"
+            echo "KSU_REF=$ref"
+            echo "KSU_SHA=$sha"
+            echo "KSU_TAG=$tag"
+          } >> "$GITHUB_ENV"
+          echo "KernelSU siap: $name${tag:+ $tag} (${sha:0:8})"
+
+      - name: Pasang SUSFS (cabang otomatis sesuai versi kernel)
+        if: ${{ env.SUSFS_ON == 'true' }}
+        run: |
+          set -euo pipefail
+          W="$GITHUB_WORKSPACE"; K="$W/src/kernel"; S="$W/susfs4ksu"
+          LOG="$W/susfs-patch.log"; : > "$LOG"
+
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n+1))
+              [ "$n" -ge 5 ] && return 1
+              echo "retry $n/5: $*" >&2
+              sleep 5
+            done
+          }
+
+          if [ -e "$K/fs/susfs.c" ] || [ -e "$K/include/linux/susfs.h" ]; then
+            echo "::error::kernel tree sudah memuat SUSFS (fs/susfs.c). Matikan input susfs atau pakai tree tanpa SUSFS."
+            exit 1
+          fi
+
+          # --- sumber: repo kanonik (gitlab) lalu mirror GitHub (SHA commit identik); repo kustom dipakai apa adanya ---
+          if [ -n "$SUSFS_REPO_IN" ]; then
+            u="$SUSFS_REPO_IN"
+            if [[ "$u" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then u="https://github.com/$u.git"; fi
+            urls=("$u")
+          else
+            urls=("$SUSFS_DEFAULT_REPO" "$SUSFS_MIRROR_REPO")
+          fi
+          rm -rf "$S"; src=""
+          for u in "${urls[@]}"; do
+            echo "clone SUSFS dari $u"
+            if retry git clone --quiet --filter=blob:none --no-checkout "$u" "$S"; then src="$u"; break; fi
+            rm -rf "$S"
+          done
+          [ -n "$src" ] || { echo "::error::gagal clone SUSFS dari: ${urls[*]}"; exit 1; }
+
+          # --- cabang menurut versi kernel; kalau ada dua kandidat (android12/13, 13/14) dipilih yang
+          #     file dasar patch-nya paling cocok (blob git) dengan tree Anda ---
+          mm="${LINUX_VERSION%.*}"
+          case "$mm" in
+            4.9)  cand="kernel-4.9" ;;
+            4.14) cand="kernel-4.14" ;;
+            4.19) cand="kernel-4.19" ;;
+            5.4)  cand="kernel-5.4" ;;
+            5.10) cand="gki-android12-5.10 gki-android13-5.10" ;;
+            5.15) cand="gki-android13-5.15 gki-android14-5.15" ;;
+            6.1)  cand="gki-android14-6.1" ;;
+            6.6)  cand="gki-android15-6.6" ;;
+            6.12) cand="gki-android16-6.12" ;;
+            *) echo "::error::versi kernel $LINUX_VERSION tidak ada di tabel cabang SUSFS (isi susfs_branch manual)"; exit 1 ;;
+          esac
+          if [ -n "$SUSFS_BRANCH_IN" ] && [ "$SUSFS_BRANCH_IN" != auto ]; then cand="$SUSFS_BRANCH_IN"; fi
+
+          set +e
+          # shellcheck disable=SC2086
+          branch=$(python3 - "$K" "$S" "$BRANCH_HINT" "$SUSFS_COMMIT_IN" $cand <<'PY'
+          import os, re, subprocess, sys
+
+          kdir, sdir, hint, commit, *cands = sys.argv[1:]
+
+          def git(*args):
+              return subprocess.run(['git', '-C', sdir, *args], capture_output=True, text=True)
+
+          def blob(path):
+              r = subprocess.run(['git', 'hash-object', path], capture_output=True, text=True)
+              return r.stdout.strip() if r.returncode == 0 else ''
+
+          rows = []
+          for i, c in enumerate(cands):
+              ref = commit if commit else 'origin/' + c
+              if git('rev-parse', '--verify', '--quiet', ref + '^{commit}').returncode != 0:
+                  print('  %s: ref tidak ada' % c, file=sys.stderr)
+                  continue
+              if commit and git('merge-base', '--is-ancestor', commit, 'origin/' + c).returncode != 0:
+                  print('  %s: commit %s bukan bagian dari cabang ini' % (c, commit[:8]), file=sys.stderr)
+                  continue
+              names = git('ls-tree', '--name-only', ref, 'kernel_patches/').stdout.split()
+              pf = [n for n in names if re.search(r'/50_add_susfs_in_.*\.patch$', n)]
+              if not pf:
+                  print('  %s: tidak ada patch kernel 50_add_susfs_in_*' % c, file=sys.stderr)
+                  continue
+              text = git('show', ref + ':' + pf[0]).stdout
+              ents = re.findall(r'^diff --git a/(\S+) b/\S+\nindex ([0-9a-f]+)\.\.[0-9a-f]+', text, re.M)
+              total = hit = 0
+              for f, old in ents:
+                  p = os.path.join(kdir, f)
+                  if not os.path.isfile(p):
+                      continue
+                  total += 1
+                  if blob(p).startswith(old):
+                      hit += 1
+              print('  %s: %d/%d file dasar patch identik dengan tree' % (c, hit, total), file=sys.stderr)
+              rows.append((-hit, 0 if hint and c.endswith(hint) else 1, i, c))
+          if not rows:
+              sys.exit(2)
+          rows.sort()
+          print(rows[0][3])
+          PY
+          )
+          rc=$?
           set -e
-
-
-          mkdir -p rekernel-ebpf-build
-          cd rekernel-ebpf-build
-
-
-          curl -sSL -o bpftool.tar.gz \
-            https://github.com/libbpf/bpftool/releases/download/v7.5.0/bpftool-v7.5.0-amd64.tar.gz
-          mkdir -p bpftool-bin
-          tar -xzf bpftool.tar.gz -C bpftool-bin
-          chmod +x bpftool-bin/bpftool
-
-          wget -q https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
-          unzip -q android-ndk-r27d-linux.zip
-
-          # ---- Fetch only the eBPF-Source subfolder from Re-Kernel ----
-          git clone --depth=1 --filter=blob:none --sparse \
-            https://github.com/Sakion-Team/Re-Kernel.git rekernel-ebpf-src
-          cd rekernel-ebpf-src
-          git sparse-checkout set eBPF-Source
-          cd eBPF-Source
-
-
-          "${GITHUB_WORKSPACE}/rekernel-ebpf-build/bpftool-bin/bpftool" btf dump file \
-            "${GITHUB_WORKSPACE}/${SOC}/out/vmlinux" format c > include/vmlinux.h
-
-          NDK_PATH="${GITHUB_WORKSPACE}/rekernel-ebpf-build/android-ndk-r27d"
-
-          if ! make ARCH=aarch64 API=35 NDK_PATH="${NDK_PATH}"; then
-            echo "::warning::Re-Kernel eBPF build failed with plain vmlinux.h — retrying with EXTRA_BPF_CFLAGS=-DRK_DEFINE_BINDER_TYPES (binder structs may be missing from our BTF dump)."
-            make clean
-            make ARCH=aarch64 API=35 NDK_PATH="${NDK_PATH}" EXTRA_BPF_CFLAGS=-DRK_DEFINE_BINDER_TYPES
+          if [ "$rc" -ne 0 ] || [ -z "$branch" ]; then
+            echo "::error::tidak ada cabang SUSFS yang cocok untuk kernel $LINUX_VERSION (cek input susfs_branch / susfs_commit). Cabang tersedia di sumber:"
+            git -C "$S" branch -r | sed 's#^ *origin/##' | grep -E '^(gki-|kernel-)' || true
+            exit 1
           fi
 
-          mkdir -p "${GITHUB_WORKSPACE}/rekernel-ebpf-out"
-          cp out/rekernel.bpf.o "${GITHUB_WORKSPACE}/rekernel-ebpf-out/"
-          cp out/rekerneld_aarch64 "${GITHUB_WORKSPACE}/rekernel-ebpf-out/"
+          ref="origin/$branch"
+          if [ -n "$SUSFS_COMMIT_IN" ]; then ref="$SUSFS_COMMIT_IN"; fi
+          git -C "$S" checkout --quiet --detach "$ref"
+          commit=$(git -C "$S" rev-parse HEAD)
+          P=$(find "$S/kernel_patches" -maxdepth 1 -name '50_add_susfs_in_*.patch' | head -n 1)
+          [ -f "$P" ] || { echo "::error::patch kernel SUSFS tidak ditemukan di $branch"; exit 1; }
+          echo "SUSFS: cabang $branch @ ${commit:0:8} ($(basename "$P"))"
 
-      - name: Make AnyKernel3
-        run: |
-          ZIP_NAME="${KERNEL_NAME}_AOSP13_${{ inputs.ksu_type }}"
-
-          if [[ "${{ inputs.susfs }}" == true ]]; then
-            ZIP_NAME="${ZIP_NAME}_SuSFS"
-          fi
-
-          if [[ "${{ inputs.nomount }}" == true ]]; then
-            ZIP_NAME="${ZIP_NAME}_NoMount"
-          fi
-
-          ZIP_NAME="${ZIP_NAME}_$(date -u +"%Y%m%d_%H%M")"
-          git clone https://github.com/kingD2N/AnyKernel3.git
-
-          cp ${SOC}/out/arch/arm64/boot/Image AnyKernel3/Image
-          cp ${SOC}/out/arch/arm64/boot/Image ./Image
-          cd AnyKernel3
-
-          zip -r9 ../"${ZIP_NAME}.zip" * -x .git
-
-      - name: Create GitHub Release
-        run: |
-          BUILD_TIME=$(date -u +"%Y%m%d_%H%M")
-          REL_NAME="${KERNEL_NAME}-AOSP13-${BUILD_TIME}"
-          echo "REL_NAME=${REL_NAME}" >> $GITHUB_ENV
-          cd ${GITHUB_WORKSPACE}
-          ZIP_FILE=$(ls *.zip)
-
-          ASSETS=("${ZIP_FILE}")
-          if [[ "${{ inputs.rekernel_ebpf }}" == true ]]; then
-            ASSETS+=("rekernel-ebpf-out/rekernel.bpf.o" "rekernel-ebpf-out/rekerneld_aarch64")
-          fi
-
-          if [[ "${{ inputs.susfs }}" == true ]]; then
-            if [[ "${SUSFS_REJ_COUNT:-0}" -gt 0 ]]; then
-              susfs_checkbox="Partially supported (susfs4ksu@${SUSFS_COMMIT} - ${SUSFS_REJ_COUNT} hunk(s) didn't apply, see susfs-rejects artifact)"
+          # patch: ketat dulu (tanpa fuzz); kalau gagal baru toleransi fuzz bawaan patch + peringatan
+          apply_patch() {  # <direktori> <file patch> <label>
+            local d=$1 p=$2 label=$3
+            echo "== $label" >> "$LOG"
+            if ( cd "$d" && patch -p1 -F0 --dry-run --no-backup-if-mismatch < "$p" ) >> "$LOG" 2>&1; then
+              ( cd "$d" && patch -p1 -F0 --no-backup-if-mismatch < "$p" ) >> "$LOG" 2>&1
+            elif ( cd "$d" && patch -p1 --dry-run --no-backup-if-mismatch < "$p" ) >> "$LOG" 2>&1; then
+              echo "::warning::$label: konteks patch tidak 100% sama dengan tree, diterapkan dengan toleransi fuzz"
+              ( cd "$d" && patch -p1 --no-backup-if-mismatch < "$p" ) >> "$LOG" 2>&1
             else
-              susfs_checkbox="Supported (susfs4ksu@${SUSFS_COMMIT})"
+              echo "::error::$label: patch gagal diterapkan. Hunk bermasalah:"
+              grep -E 'FAILED|can.t find file|No such file' "$LOG" | tail -n 40 || true
+              return 1
+            fi
+            echo "$label: OK ($(grep -c 'succeeded at' "$LOG" || true) hunk bergeser/offset)"
+          }
+
+          cp "$S"/kernel_patches/fs/* "$K/fs/"
+          cp "$S"/kernel_patches/include/linux/* "$K/include/linux/"
+          apply_patch "$K" "$P" "patch kernel $(basename "$P")"
+          if [ "$KSU_VARIANT" = kernelsu ]; then
+            KP="$S/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+            [ -f "$KP" ] || { echo "::error::10_enable_susfs_for_ksu.patch tidak ada di cabang $branch"; exit 1; }
+            apply_patch "$K/KernelSU" "$KP" "patch KernelSU 10_enable_susfs_for_ksu"
+          fi
+          # objek yang tersentuh patch SUSFS -> dikompilasi lebih awal oleh step "Pra-cek KernelSU <-> SUSFS"
+          { echo "fs/susfs.c"; sed -n 's#^diff --git a/\(.*\.c\) b/.*#\1#p' "$P"; } | sort -u | sed 's/\.c$/.o/' > "$W/susfs-objs.txt"
+          if find "$K" -path "$K/out" -prune -o \( -name '*.rej' -o -name '*.orig' \) -print | grep -q .; then
+            echo "::error::ada file .rej/.orig setelah patch"
+            find "$K" -path "$K/out" -prune -o \( -name '*.rej' -o -name '*.orig' \) -print
+            exit 1
+          fi
+
+          ver=$(grep -E '^#define SUSFS_VERSION' "$K/include/linux/susfs.h" | cut -d'"' -f2)
+          [ -n "$ver" ] || { echo "::error::SUSFS_VERSION tidak terbaca dari susfs.h"; exit 1; }
+          {
+            echo "SUSFS_VERSION=$ver"
+            echo "SUSFS_BRANCH=$branch"
+            echo "SUSFS_COMMIT=$commit"
+            echo "SUSFS_SRC=$src"
+          } >> "$GITHUB_ENV"
+          echo "SUSFS $ver terpasang (cabang $branch)"
+
+      - name: Konfigurasi kernel
+        run: |
+          set -euo pipefail
+          kcc=clang
+          [ "$USE_CCACHE" = true ] && kcc="ccache clang"
+          export KCC="$kcc"
+          echo "KCC=$kcc" >> "$GITHUB_ENV"
+
+          # wrapper make: dipakai step konfigurasi, build, dan paket
+          cat > "$GITHUB_WORKSPACE/kmake.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/src/kernel"
+          exec make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            CC="$KCC" KBUILD_DTC_INCLUDE="$DTC_INC" $EXTRA_MAKE_ARGS "$@"
+          EOF
+          chmod +x "$GITHUB_WORKSPACE/kmake.sh"
+
+          cd "$GITHUB_WORKSPACE/src/kernel"
+          cfgdir=arch/arm64/configs
+          [ -f "$cfgdir/gki_defconfig" ] || { echo "::error::$cfgdir/gki_defconfig tidak ada"; exit 1; }
+          parts=("$cfgdir/gki_defconfig")
+          for f in $DEFCONFIG_FRAGMENTS; do
+            [ -f "$cfgdir/$f" ] || { echo "::error::fragment config tidak ditemukan: $cfgdir/$f"; exit 1; }
+            parts+=("$cfgdir/$f")
+          done
+
+          # fragment KernelSU/SUSFS paling akhir supaya menang atas defconfig tree (yang sudah memuat simbol SUSFS)
+          mkdir -p "$cfgdir/vendor"
+          if [ "$KSU_ON" = true ]; then
+            frag="$cfgdir/vendor/ci_ksu.config"
+            sub="SUS_PATH SUS_MOUNT SUS_KSTAT SPOOF_UNAME ENABLE_LOG HIDE_KSU_SUSFS_SYMBOLS SPOOF_CMDLINE_OR_BOOTCONFIG OPEN_REDIRECT SUS_MAP"
+            {
+              echo "CONFIG_KSU=y"
+              if [ "$SUSFS_ON" = true ]; then
+                # ReSukiSU: SUSFS inline hook adalah salah satu pilihan "choice" hook; pilih eksplisit
+                if [ "$KSU_VARIANT" = resukisu ]; then
+                  echo "# CONFIG_KSU_TRACEPOINT_HOOK is not set"
+                  echo "# CONFIG_KSU_MANUAL_HOOK is not set"
+                fi
+                echo "CONFIG_KSU_SUSFS=y"
+                for s in $sub; do echo "CONFIG_KSU_SUSFS_$s=y"; done
+              else
+                # tanpa SUSFS: matikan simbol SUSFS yang sudah ada di defconfig tree
+                if [ "$KSU_VARIANT" = resukisu ]; then echo "CONFIG_KSU_TRACEPOINT_HOOK=y"; fi
+                echo "# CONFIG_KSU_SUSFS is not set"
+                for s in $sub; do echo "# CONFIG_KSU_SUSFS_$s is not set"; done
+              fi
+            } > "$frag"
+            parts+=("$frag")
+          fi
+          cat "${parts[@]}" > "$cfgdir/vendor/ci_defconfig"
+          echo "defconfig = ${parts[*]}"
+
+          if ! "$GITHUB_WORKSPACE/kmake.sh" vendor/ci_defconfig > "$GITHUB_WORKSPACE/defconfig.log" 2>&1; then
+            tail -n 40 "$GITHUB_WORKSPACE/defconfig.log"
+            exit 1
+          fi
+          echo "override simbol saat merge (normal): $(grep -c 'warning: override' "$GITHUB_WORKSPACE/defconfig.log" || true)"
+
+          cfg=out/.config
+          if [ "$LTO" = none ]; then
+            scripts/config --file "$cfg" -e LTO_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d CFI_CLANG
+          fi
+          if [ -n "$LOCALVERSION_OVERRIDE" ]; then
+            scripts/config --file "$cfg" --set-str LOCALVERSION "$LOCALVERSION_OVERRIDE"
+          fi
+          "$GITHUB_WORKSPACE/kmake.sh" olddefconfig > /dev/null
+
+          grep -q '^CONFIG_ARCH_WAIPIO=y' "$cfg" || { echo "::error::CONFIG_ARCH_WAIPIO tidak aktif setelah merge config; DT SM8450 tidak akan ikut dibangun"; exit 1; }
+          grep -E '^CONFIG_(LOCALVERSION|LTO_[A-Z_]+|CFI_CLANG|BUILD_ARM64_DT_OVERLAY|ARCH_WAIPIO)=' "$cfg" || true
+
+          if [ "$KSU_ON" = true ]; then
+            grep -q '^CONFIG_KSU=y' "$cfg" || { echo "::error::CONFIG_KSU tidak aktif setelah merge config"; exit 1; }
+            if [ "$SUSFS_ON" = true ]; then
+              grep -q '^CONFIG_KSU_SUSFS=y' "$cfg" || { echo "::error::CONFIG_KSU_SUSFS tidak aktif setelah merge config (Kconfig varian ini tidak punya simbol SUSFS?)"; exit 1; }
+            elif grep -q '^CONFIG_KSU_SUSFS=y' "$cfg"; then
+              echo "::error::CONFIG_KSU_SUSFS masih aktif padahal input susfs=false"
+              exit 1
+            fi
+            grep -E '^CONFIG_KSU' "$cfg" | head -n 30
+          fi
+
+      - name: Pra-cek KernelSU <-> SUSFS (sebelum build penuh)
+        if: ${{ env.SUSFS_ON == 'true' }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          K=src/kernel
+          # Hook KernelSU dan patch kernel SUSFS sering tidak sinkron antar-versi (fungsi hilang / beda tipe) dan
+          # baru ketahuan saat link, setelah build berjam-jam. Di sini hanya objek yang tersentuh (patch SUSFS +
+          # driver KernelSU) yang dikompilasi; hasilnya dipakai ulang build penuh, jadi tidak ada kerja terbuang.
+          [ -s susfs-objs.txt ] || { echo "::error::susfs-objs.txt kosong (step SUSFS tidak berjalan?)"; exit 1; }
+          mapfile -t objs < susfs-objs.txt
+          # init/version.o -> generated/compile.h, security/selinux/avc.o -> flask.h; keduanya dibutuhkan driver KernelSU
+          # (di build penuh sudah tersedia sebelum drivers/ dibangun)
+          if ! { ./kmake.sh -j"$(nproc)" init/version.o security/selinux/avc.o "${objs[@]}" \
+                 && ./kmake.sh -j"$(nproc)" drivers/kernelsu/; } > preflight.log 2>&1; then
+            grep -nE 'error:|Error [0-9]+|You (should|lost)' preflight.log | head -n 30 || true
+            echo "::error::pra-cek gagal: patch SUSFS / driver KernelSU tidak bisa dikompilasi. Biasanya versi KernelSU dan SUSFS tidak cocok; coba ksu_variant lain, atau pin susfs_commit / ksu_ref yang sepasang."
+            exit 1
+          fi
+          { printf '%s\n' "${objs[@]}" | sed "s#^#$K/out/#"; find "$K/out/drivers/kernelsu" -name '*.o'; } > preflight-objs.txt
+          python3 - preflight-objs.txt <<'PY'
+          import re, subprocess, sys
+          objs = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+          und, dfn = {}, set()
+          for o in objs:
+              out = subprocess.run(['llvm-nm', '-g', o], capture_output=True, text=True).stdout
+              for line in out.splitlines():
+                  p = line.split()
+                  if len(p) < 2 or len(p[-2]) != 1:
+                      continue
+                  kind, name = p[-2], p[-1]
+                  if kind == 'U':
+                      und.setdefault(name, o)
+                  elif kind in 'TtDdBbRrWwVvAaCcSsGgIi':
+                      dfn.add(name)
+          hook = re.compile(r'^(__)?(ksu|susfs)_')
+          miss = sorted((n, o) for n, o in und.items() if hook.match(n) and n not in dfn)
+          if miss:
+              print('::error::simbol KernelSU/SUSFS dipanggil tapi tidak didefinisikan di mana pun (KernelSU dan SUSFS beda versi); build penuh pasti gagal saat link:')
+              for n, o in miss[:30]:
+                  print('  %s  <- %s' % (n, o.split('/out/')[-1]))
+              print('Coba ksu_variant lain, atau pin susfs_commit / ksu_ref yang sepasang.')
+              sys.exit(1)
+          print('pra-cek OK: %d objek, semua simbol ksu_*/susfs_* terselesaikan' % len(objs))
+          PY
+
+      - name: Build kernel (Image + dtbs + modules)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          targets=(Image dtbs)
+          [ "$BUILD_MODULES" = true ] && targets+=(modules)
+          echo "target make: ${targets[*]} (-j$(nproc))"
+          start=$(date +%s)
+          ./kmake.sh -j"$(nproc)" "${targets[@]}" 2>&1 | tee build.log
+          echo "BUILD_MINUTES=$(( ($(date +%s) - start) / 60 ))" >> "$GITHUB_ENV"
+          [ "$USE_CCACHE" = true ] && ccache -s || true
+
+      - name: Ringkasan error build
+        if: ${{ failure() }}
+        run: |
+          for f in preflight.log build.log; do
+            [ -f "$f" ] || continue
+            echo "===== $f ====="
+            grep -nE 'error:|Error [0-9]+|undefined (reference|symbol)|No rule to make target|You should integrate|You lost' "$f" | head -n 40 || true
+            echo "----- 60 baris terakhir -----"
+            tail -n 60 "$f" || true
+          done
+
+      - name: Paket (AnyKernel3 + file pendukung)
+        id: pack
+        run: |
+          set -euo pipefail
+          W="$GITHUB_WORKSPACE"
+          OUTD="$W/src/kernel/out"
+          BOOT="$OUTD/arch/arm64/boot"
+          DTBOUT="$BOOT/dts/vendor/qcom"
+          [ -f "$BOOT/Image" ] || { echo "::error::Image tidak terbentuk"; exit 1; }
+          [ -f "$DTBOUT/waipio.dtb" ] || { echo "::error::waipio.dtb tidak terbentuk (DT tidak ikut dibangun)"; exit 1; }
+          rel=$(cat "$OUTD/include/config/kernel.release")
+          knm=$(printf '%s' "$KERNEL_NAME" | tr -c 'A-Za-z0-9._-' '-')
+
+          # label root untuk nama zip / kernel.string / catatan
+          if [ "$KSU_ON" = true ]; then
+            ksu_label="${KSU_NAME}"
+            tag="${KSU_NAME}"
+            if [ "$SUSFS_ON" = true ]; then
+              ksu_label="${KSU_NAME} + SUSFS ${SUSFS_VERSION}"
+              tag="${KSU_NAME}-SUSFS"
             fi
           else
-            susfs_checkbox="Unsupported"
+            ksu_label="tanpa KernelSU"
+            tag="NoKSU"
           fi
+          name="${knm}-${LINUX_VERSION}-${TARGET_DEVICE}-${tag}-$(date -u +%Y%m%d-%H%M)"
+          mkdir -p "$W/dist" "$W/extras"
 
-          if [[ "${{ inputs.BBG }}" == true ]]; then
-            bbg_checkbox="Supported"
+          # --- AnyKernel3: template dipin; folder tools/ milik Anda (kalau ada) menggantikan tools/ template ---
+          rm -rf "$W/ak3" && mkdir "$W/ak3" && cd "$W/ak3"
+          git init -q
+          git remote add origin "https://github.com/${AK3_REPO}.git"
+          git fetch -q --depth 1 origin "$AK3_SHA"
+          git checkout -q FETCH_HEAD
+          rm -rf .git .github
+          tools_src=""
+          if [ -n "$AK3_TOOLS_DIR" ] && [ -f "$W/ci/$AK3_TOOLS_DIR/ak3-core.sh" ]; then
+            tools_src="$W/ci/$AK3_TOOLS_DIR"
+          fi
+          if [ -n "$tools_src" ]; then
+            rm -rf tools && mkdir tools
+            cp -a "$tools_src"/. tools/
+            tools_note="tools/ dari repo ini ($AK3_TOOLS_DIR)"
           else
-            bbg_checkbox="Unsupported"
+            tools_note="tools/ bawaan template AnyKernel3 (${AK3_SHA:0:8}); folder '$AK3_TOOLS_DIR' dengan ak3-core.sh tidak ditemukan di repo ini"
           fi
+          find tools -type f -exec chmod 755 {} +
+          echo "AnyKernel3: $tools_note"
 
-          if [[ "${{ inputs.rekernel_netlink }}" == true ]]; then
-            rekernel_netlink_checkbox="Supported"
+          # ak3-core.sh lama (sebelum Mei 2024) membaca variabel huruf kecil (block=, is_slot_device=, ...),
+          # core baru huruf besar (BLOCK=, IS_SLOT_DEVICE=, ...). anykernel.sh harus cocok dengan core yang dipakai.
+          if grep -qE '\$\{?BLOCK\b' tools/ak3-core.sh; then
+            v_block=BLOCK; v_slot=IS_SLOT_DEVICE; v_comp=RAMDISK_COMPRESSION; v_vbmeta=PATCH_VBMETA_FLAG; core_style="huruf besar (AK3 baru)"
+          elif grep -qE '\$\{?block\b' tools/ak3-core.sh; then
+            v_block=block; v_slot=is_slot_device; v_comp=ramdisk_compression; v_vbmeta=patch_vbmeta_flag; core_style="huruf kecil (AK3 lama)"
           else
-            rekernel_netlink_checkbox="Unsupported"
+            echo "::error::tools/ak3-core.sh tidak dikenali (tidak ada variabel block/BLOCK)"
+            exit 1
           fi
+          echo "gaya variabel ak3-core.sh: $core_style"
 
-          if [[ "${{ inputs.rekernel_ebpf }}" == true ]]; then
-            rekernel_ebpf_checkbox="Supported (daemon+prog attached as release assets)"
-          else
-            rekernel_ebpf_checkbox="Unsupported"
+          cp "$BOOT/Image" Image
+          cat > anykernel.sh <<EOF
+          ### AnyKernel3 - ${knm} (${TARGET_DEVICE})
+          properties() { '
+          kernel.string=${knm} ${LINUX_VERSION} (${TARGET_DEVICE}) ${ksu_label} by kingD2N
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=${TARGET_DEVICE}
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          # boot shell variables
+          ${v_block}=boot;
+          ${v_slot}=auto;
+          ${v_comp}=auto;
+          ${v_vbmeta}=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # hanya ganti kernel; ramdisk tidak di-unpack/repack
+          split_boot;
+          flash_boot;
+          EOF
+          zip -r9 -q "$W/dist/$name.zip" . -x 'README.md' '.git*'
+          cd "$W/dist"
+          sha256sum "$name.zip" > "$name.zip.sha256"
+
+          # --- file pendukung ---
+          cd "$W"
+          cp "$BOOT/Image" "extras/Image-$LINUX_VERSION"
+          cp "$OUTD/.config" "extras/config-$rel"
+          find "$DTBOUT" \( -name '*.dtb' -o -name '*.dtbo' \) -printf '%P\n' \
+            | tar --zstd -cf "extras/dtbs-qcom-ref-$LINUX_VERSION.tar.zst" -C "$DTBOUT" -T -
+          if [ "$BUILD_MODULES" = true ]; then
+            rm -rf "$W/modules_out"
+            "$W/kmake.sh" INSTALL_MOD_PATH="$W/modules_out" INSTALL_MOD_STRIP=1 modules_install > "$W/modules_install.log" 2>&1 \
+              || { tail -n 40 "$W/modules_install.log"; exit 1; }
+            rm -f "$W"/modules_out/lib/modules/*/build "$W"/modules_out/lib/modules/*/source
+            tar --zstd -cf "extras/modules-$rel.tar.zst" -C "$W/modules_out" .
           fi
+          {
+            echo "kernel      : $rel ($LINUX_VERSION)"
+            echo "kernel repo : $KERNEL_REPO@$KERNEL_BRANCH ($KERNEL_SHA)"
+            echo "DT repo     : $DT_REPO@$DT_BRANCH ($DT_SHA)"
+            echo "modules repo: $MODULES_REPO@$MODULES_BRANCH ($MOD_SHA)"
+            echo "defconfig   : gki_defconfig $DEFCONFIG_FRAGMENTS"
+            if [ "$KSU_ON" = true ]; then
+              echo "kernelsu    : $KSU_NAME${KSU_TAG:+ $KSU_TAG} ($KSU_REPO@$KSU_REF ${KSU_SHA:0:8})"
+            else
+              echo "kernelsu    : tidak ada"
+            fi
+            if [ "$SUSFS_ON" = true ]; then
+              echo "susfs       : $SUSFS_VERSION (cabang $SUSFS_BRANCH @ ${SUSFS_COMMIT:0:8}, sumber $SUSFS_SRC)"
+            else
+              echo "susfs       : tidak ada"
+            fi
+            echo "anykernel3  : $tools_note; core $core_style"
+            echo "lto         : $LTO"
+            echo "toolchain   : $(head -n 1 "$W/toolchain.txt")"
+            echo "build       : ${BUILD_MINUTES:-?} menit"
+            echo
+            echo "CATATAN: DT sumber berisi board referensi Qualcomm (tanpa board Xiaomi/ingres), jadi dtbs-qcom-ref-*"
+            echo "adalah hasil compile untuk verifikasi, bukan untuk diflash. Zip AnyKernel3 hanya mengganti Image."
+          } > "extras/build-info.txt"
 
-          if [[ "${{ inputs.droidspaces }}" == true ]]; then
-            droidspaces_checkbox="Supported"
-          else
-            droidspaces_checkbox="Unsupported"
-          fi
+          {
+            echo "zip=$W/dist/$name.zip"
+            echo "name=$name"
+            echo "rel=$rel"
+            echo "ksu_label=$ksu_label"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Kernel $rel"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Kernel | \`$KERNEL_REPO@$KERNEL_BRANCH\` ($KERNEL_SHA) |"
+            echo "| DT | \`$DT_REPO@$DT_BRANCH\` ($DT_SHA) |"
+            if [ "$KSU_ON" = true ]; then
+              echo "| KernelSU | $KSU_NAME${KSU_TAG:+ $KSU_TAG} (\`$KSU_REPO@$KSU_REF\` ${KSU_SHA:0:8}) |"
+            else
+              echo "| KernelSU | tidak ada |"
+            fi
+            if [ "$SUSFS_ON" = true ]; then
+              echo "| SUSFS | $SUSFS_VERSION, cabang \`$SUSFS_BRANCH\` (${SUSFS_COMMIT:0:8}) |"
+            fi
+            echo "| AnyKernel3 | $tools_note |"
+            echo "| Toolchain | $(head -n 1 "$W/toolchain.txt") |"
+            echo "| Build | ${BUILD_MINUTES:-?} menit, LTO: $LTO |"
+            echo "| Zip | \`$name.zip\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist extras
 
-          if [[ "${{ inputs.nomount }}" == true ]]; then
-            nomount_checkbox="Supported (maxsteeel/nomount@master@${NOMOUNT_COMMIT})"
-          else
-            nomount_checkbox="Unsupported"
-          fi
+      - name: Upload zip flashable (artifact)
+        if: ${{ inputs.release_repo == '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          # archive: false -> zip di-upload apa adanya; nama artifact = nama file zip
+          path: ${{ steps.pack.outputs.zip }}
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
 
-          cat > release_notes.md << NOTES_EOF
-          #
+      - name: Upload file pendukung (artifact)
+        if: ${{ inputs.release_repo == '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pack.outputs.name }}-extras
+          path: extras/
+          retention-days: 7
+          if-no-files-found: error
 
-          <img width="512" height="279" alt="image_0c69b253-1d7c-4fda-9f53-08ba18f46a10" src="https://github.com/user-attachments/assets/ba10704d-00c8-45d1-bde0-bd8bdb3618d2" />
+      - name: Upload ke GitHub Release
+        if: ${{ inputs.release_repo != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_REPO: ${{ inputs.release_repo }}
+          NAME: ${{ steps.pack.outputs.name }}
+          REL: ${{ steps.pack.outputs.rel }}
+          KSU_LABEL: ${{ steps.pack.outputs.ksu_label }}
+        run: |
+          set -euo pipefail
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::secret RELEASE_TOKEN belum diisi"; exit 1; }
+          cd "$GITHUB_WORKSPACE"
+          assets=(dist/*.zip dist/*.sha256 extras/*)
+          tag="${NAME}-r${GITHUB_RUN_NUMBER}"
+          {
+            echo "Kernel ${REL} untuk ${TARGET_DEVICE} - ${KSU_LABEL}"
+            echo
+            echo "Flash zip lewat OrangeFox/TWRP (backup boot dulu). Zip hanya mengganti kernel Image di boot;"
+            echo "ramdisk dan DTB tidak diubah."
+            if [ "$KSU_ON" = true ]; then
+              echo
+              echo "Pasang aplikasi manager yang sesuai dengan varian: ${KSU_NAME} (${KSU_REPO})."
+            fi
+            echo
+            echo '```'
+            cat extras/build-info.txt
+            echo '```'
+          } > notes.md
+          gh release create "$tag" "${assets[@]}" --repo "$RELEASE_REPO" \
+            --title "$NAME" --notes-file notes.md
 
-          | | |
-          |:---|:---|
-          | 📱 Device | POCO F4 GT (ingres) • Redmi K50G (ingres) |
-          | 🟠 ROM Support | AOSP Android 13 |
-          | 🖥️ Kernel Name | ${KERNEL_NAME} |
-          | 🧬 Kernel Base | ${KERNEL_BASE} |
-          | 🌳 Devicetree | ${DT_SOURCE} @ ${DT_BRANCH} |
-          | 🛠️ Build Scope | ZIP |
-          | 📦 Source | ${{ inputs.kernel_source }} |
-          | ⚔️ Kernel branch | ${{ inputs.kernel_branch }} |
-          | 💻 KSU Manager type | ${{ inputs.ksu_type }} |
-          | 🔧 SuSFS Version | ${susfs_checkbox} |
-          | ⚙️ BBG Patch | ${bbg_checkbox} |
-          | ⚙️ Re-Kernel (Netlink) | ${rekernel_netlink_checkbox} |
-          | ⚙️ Re-Kernel (eBPF) | ${rekernel_ebpf_checkbox} |
-          | 🧩 DroidSpaces | ${droidspaces_checkbox} |
-          | 🗂️ NoMount | ${nomount_checkbox} |
-          | 🔨 Compiler | LLVM/Clang ${LLVM_VERSION} Official |
-
-          ---
-          NOTES_EOF
-
-          gh release create "$REL_NAME" --title "$REL_NAME" --notes-file release_notes.md "${ASSETS[@]}"
+      - name: Upload log build (saat gagal)
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            build.log
+            preflight.log
+            defconfig.log
+            susfs-patch.log
+            src/kernel/out/.config
+          retention-days: 7
+          if-no-files-found: ignore
